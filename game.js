@@ -1,5 +1,11 @@
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
+const gameWrap = document.getElementById('gameWrap');
+const hud = document.getElementById('hud');
+const overlay = document.getElementById('overlay');
+const overlayTitle = document.getElementById('overlayTitle');
+const overlayText = document.getElementById('overlayText');
+const actionBtn = document.getElementById('actionBtn');
 
 const W = canvas.width;
 const H = canvas.height;
@@ -22,11 +28,12 @@ const player = {
 
 let obstacles = [];
 let spawnTimer = 0;
-let nextSpawnIn = randRange(65, 105);
+let nextSpawnIn = 80;
 let score = 0;
 let frame = 0;
-let running = true;
-let gameOver = false;
+let state = 'start';
+let landSquash = 0;
+let audioCtx = null;
 
 function randRange(min, max) {
   return Math.floor(min + Math.random() * (max - min));
@@ -42,15 +49,47 @@ function playerBox() {
   return { left: player.x - player.width / 2, top, right: player.x + player.width / 2, bottom: feetY + 6 };
 }
 
+function beep(freq, dur, type, vol) {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.value = vol || 0.06;
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+    osc.stop(audioCtx.currentTime + dur);
+  } catch (e) {}
+}
+
+function vibrate(pattern) {
+  if (navigator.vibrate) navigator.vibrate(pattern);
+}
+
 function jump() {
-  if (!running) return;
   if (player.grounded) {
     player.vy = JUMP_FORCE;
     player.grounded = false;
+    beep(520, 0.07, 'sine', 0.05);
+    vibrate(10);
   }
 }
 
-function resetGame() {
+function showOverlay(title, text, btnLabel) {
+  overlayTitle.textContent = title;
+  overlayText.textContent = text;
+  actionBtn.textContent = btnLabel;
+  overlay.classList.remove('hidden');
+}
+
+function hideOverlay() {
+  overlay.classList.add('hidden');
+}
+
+function resetRuntimeState() {
   obstacles = [];
   spawnTimer = 0;
   nextSpawnIn = randRange(65, 105);
@@ -59,14 +98,30 @@ function resetGame() {
   player.y = 0;
   player.vy = 0;
   player.grounded = true;
-  gameOver = false;
-  running = true;
+  landSquash = 0;
+  hud.textContent = '🎾 0';
+}
+
+function startPlaying() {
+  resetRuntimeState();
+  state = 'playing';
+  hideOverlay();
+}
+
+function triggerGameOver() {
+  state = 'gameover';
+  gameWrap.classList.add('shake');
+  setTimeout(() => gameWrap.classList.remove('shake'), 300);
+  beep(160, 0.25, 'sawtooth', 0.07);
+  vibrate([15, 40, 15]);
+  showOverlay('¡Juego Terminado!', 'Puntaje: ' + score, 'Reintentar');
+  actionBtn.focus();
 }
 
 function handleAction() {
-  if (gameOver) {
-    resetGame();
-  } else {
+  if (state === 'start' || state === 'gameover') {
+    startPlaying();
+  } else if (state === 'playing') {
     jump();
   }
 }
@@ -82,6 +137,7 @@ canvas.addEventListener('touchstart', (e) => {
   e.preventDefault();
   handleAction();
 }, { passive: false });
+actionBtn.addEventListener('click', handleAction);
 
 function spawnObstacle() {
   const h = randRange(32, 58);
@@ -91,6 +147,8 @@ function spawnObstacle() {
 
 function update() {
   frame++;
+
+  const wasGrounded = player.grounded;
   player.vy += GRAVITY;
   player.y += player.vy;
   if (player.y >= 0) {
@@ -98,6 +156,8 @@ function update() {
     player.vy = 0;
     player.grounded = true;
   }
+  if (player.grounded && !wasGrounded) landSquash = 1;
+  landSquash *= 0.82;
 
   const speed = currentSpeed();
 
@@ -120,13 +180,14 @@ function update() {
 
     const overlap = box.right > obLeft && box.left < obRight && box.bottom > obTop && box.top < obBottom;
     if (overlap) {
-      gameOver = true;
-      running = false;
+      triggerGameOver();
     }
 
     if (!ob.passed && obRight < box.left) {
       ob.passed = true;
       score++;
+      hud.textContent = '🎾 ' + score;
+      beep(760, 0.08, 'square', 0.04);
     }
   }
 
@@ -152,14 +213,37 @@ function drawBall(cx, cy, r) {
   ctx.stroke();
 }
 
+function drawShadow() {
+  const heightAbove = Math.max(0, -player.y);
+  const alpha = Math.max(0.12, 0.4 - heightAbove / 350);
+  const squeeze = Math.max(0.5, 1 - heightAbove / 260);
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.ellipse(player.x, GROUND_Y + 4, 20 * squeeze, 6 * squeeze, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
 function drawPlayer() {
-  const feetY = GROUND_Y + player.y;
+  const idleBob = state !== 'playing' ? Math.sin(frame * 0.06) * 1.5 : 0;
+  const feetY = GROUND_Y + player.y + idleBob;
   const legY = feetY - 8;
   const torsoY = feetY - 30;
   const headY = feetY - 55;
 
-  const running_ = player.grounded;
-  const swing = running_ ? Math.sin(frame * 0.35) * 9 : 0;
+  const isRunning = player.grounded && state === 'playing';
+  const swing = isRunning ? Math.sin(frame * 0.35) * 9 : 0;
+
+  const airStretch = !player.grounded ? Math.max(-0.18, Math.min(0.18, -player.vy / 60)) : 0;
+  const scaleY = 1 + airStretch - landSquash * 0.22;
+  const scaleX = 1 - airStretch * 0.6 + landSquash * 0.18;
+
+  ctx.save();
+  ctx.translate(player.x, feetY);
+  ctx.scale(scaleX, scaleY);
+  ctx.translate(-player.x, -feetY);
 
   drawBall(player.x - 8 + swing, legY, 8);
   drawBall(player.x + 8 - swing, legY, 8);
@@ -175,6 +259,8 @@ function drawPlayer() {
   ctx.arc(player.x - 3.5, headY - 1, 1.4, 0, Math.PI * 2);
   ctx.arc(player.x + 3.5, headY - 1, 1.4, 0, Math.PI * 2);
   ctx.fill();
+
+  ctx.restore();
 }
 
 function drawCone(ob) {
@@ -237,42 +323,14 @@ function drawCourt() {
   }
 }
 
-function drawScore() {
-  ctx.font = '700 22px -apple-system, sans-serif';
-  ctx.textAlign = 'right';
-  ctx.fillStyle = 'rgba(26,43,50,.55)';
-  ctx.fillText(String(score), W - 22 + 2, 40 + 2);
-  ctx.fillStyle = '#ffffff';
-  ctx.fillText(String(score), W - 22, 40);
-  ctx.textAlign = 'left';
-}
-
-function drawGameOver() {
-  ctx.fillStyle = 'rgba(26,43,50,.55)';
-  ctx.fillRect(0, 0, W, H);
-
-  ctx.textAlign = 'center';
-  ctx.fillStyle = '#ffffff';
-  ctx.font = '800 40px -apple-system, sans-serif';
-  ctx.fillText('¡Juego Terminado!', W / 2, H / 2 - 26);
-
-  ctx.font = '600 20px -apple-system, sans-serif';
-  ctx.fillText('Puntaje: ' + score, W / 2, H / 2 + 12);
-
-  ctx.font = '500 15px -apple-system, sans-serif';
-  ctx.fillStyle = 'rgba(255,255,255,.85)';
-  ctx.fillText('Presiona espacio o toca para reiniciar', W / 2, H / 2 + 44);
-  ctx.textAlign = 'left';
-}
-
 function loop() {
-  if (running) update();
+  if (state === 'playing') update();
+  else frame++;
 
   drawCourt();
   for (const ob of obstacles) drawCone(ob);
+  drawShadow();
   drawPlayer();
-  drawScore();
-  if (gameOver) drawGameOver();
 
   requestAnimationFrame(loop);
 }
